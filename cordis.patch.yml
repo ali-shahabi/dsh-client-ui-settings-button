@@ -1,0 +1,6 @@
+# Settings-button bundle patch: inserts the client plugin row into the profile
+# roster. Applied as a profile bundle layer (the `dsh.bundle.patch` manifest
+# field) over dsh-base.
+- insert:
+    - id: ui-settings-button
+      name: 'dsh-client-ui-settings-button'

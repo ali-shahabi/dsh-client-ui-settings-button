@@ -1,0 +1,624 @@
+/**
+ * Sidebar menu: one trigger in the brand row, one popover that owns the shipped
+ * panel navigation and the Settings entry.
+ *
+ * The pieces are shipped DOM, not reimplementations:
+ * - the panel list is `<nav>` directly under `[data-sidebar-scrollport]`, moved
+ *   into the popover so Plugins, Automation tasks, More (its fly-out included)
+ *   and the active-row state keep working exactly as shipped;
+ * - Settings is our own `settings.launcher` occupant, which renders nothing
+ *   while this menu owns it and hands its `openSettings` + localized label over
+ *   through {@link publishLauncher}.
+ *
+ * Everything is opt-in per mount and reversible: collapsing the sidebar to the
+ * rail hands the navigation back to the rail, and any missing anchor leaves the
+ * sidebar untouched (the footer Settings row then stays where it is).
+ */
+
+/**
+ * Sidebar geometry custom properties. The shipped rows and the Settings row
+ * read them, and they are declared on the sidebar column — so a popover that
+ * lives on `document.body` must carry them over or its rows lose their padding.
+ */
+const SIDEBAR_TOKENS = [
+  '--dsh-sidebar-inline-padding',
+  '--dsh-sidebar-row-padding',
+  '--dsh-sidebar-label-gap',
+  '--dsh-sidebar-paint-inset',
+]
+
+const WIDE_MIN_WIDTH = 120
+const VIEWPORT_MARGIN = 8
+const GAP = 6
+const SYNC_DEBOUNCE_MS = 60
+
+/** Start-up retries while the sidebar column is still being mounted. */
+const RETRY_DELAYS = [80, 240, 700]
+
+/** Safety net for shells whose collapse signal is neither a resize nor an attribute. */
+const POLL_MS = 500
+
+/** Horizontal ellipsis: the conventional "these rows live in here" affordance. */
+const MENU_GLYPH = [
+  '<svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true" focusable="false">',
+  '<circle cx="3.1" cy="8" r="1.3"/><circle cx="8" cy="8" r="1.3"/><circle cx="12.9" cy="8" r="1.3"/>',
+  '</svg>',
+].join('')
+
+/**
+ * Gear as the shell draws it (`settings-outline`, medium weight = 1.3 stroke),
+ * so the Settings row matches the sidebar's own icons instead of a sun-like star.
+ */
+const SETTINGS_GLYPH = [
+  '<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.3"',
+  ' aria-hidden="true" focusable="false">',
+  '<path d="M8 9.75012C8.9665 9.75012 9.75 8.96662 9.75 8.00012C9.75 7.03362 8.9665 6.25012 8 6.25012C7.0335 6.25012 6.25 7.03362 6.25 8.00012C6.25 8.96662 7.0335 9.75012 8 9.75012Z"></path>',
+  '<path d="M13.0107 7.79377C12.9505 7.89401 12.9205 7.94413 12.9205 7.99951C12.9205 8.0549 12.9505 8.10502 13.0106 8.20528L13.9849 9.83006C14.045 9.93029 14.0751 9.9804 14.0751 10.0358C14.0751 10.0911 14.045 10.1413 13.9849 10.2415L13.0037 11.8777C12.9468 11.9726 12.9184 12.0201 12.8725 12.0461C12.8267 12.072 12.7713 12.072 12.6607 12.072H10.6704C10.5598 12.072 10.5045 12.072 10.4586 12.098C10.4128 12.1239 10.3843 12.1714 10.3274 12.2662L9.33825 13.9142C9.28133 14.009 9.25287 14.0564 9.20703 14.0823C9.16118 14.1083 9.10588 14.1083 8.99529 14.1083H7.00486C6.89426 14.1083 6.83896 14.1083 6.79312 14.0823C6.74727 14.0564 6.71881 14.009 6.6619 13.9142L5.67273 12.2662C5.61581 12.1714 5.58735 12.1239 5.54151 12.098C5.49566 12.072 5.44036 12.072 5.32977 12.072H3.33945C3.2288 12.072 3.17347 12.072 3.12761 12.0461C3.08176 12.0201 3.0533 11.9726 2.9964 11.8777L2.0152 10.2415C1.9551 10.1413 1.92505 10.0911 1.92505 10.0358C1.92505 9.9804 1.9551 9.93029 2.0152 9.83006L2.98951 8.20528C3.04963 8.10502 3.07969 8.0549 3.07969 7.99951C3.07968 7.94413 3.04961 7.89401 2.98946 7.79377L2.01529 6.17011C1.95514 6.06987 1.92507 6.01975 1.92507 5.96437C1.92506 5.90899 1.95512 5.85886 2.01524 5.7586L2.9964 4.1224C3.0533 4.0275 3.08176 3.98005 3.12761 3.95408C3.17347 3.92811 3.2288 3.92811 3.33945 3.92811H5.32977C5.44036 3.92811 5.49566 3.92811 5.54151 3.90216C5.58735 3.87621 5.61581 3.82879 5.67273 3.73397L6.6619 2.08599C6.71881 1.99116 6.74727 1.94375 6.79312 1.9178C6.83896 1.89185 6.89426 1.89185 7.00486 1.89185H8.99529C9.10588 1.89185 9.16118 1.89185 9.20703 1.9178C9.25287 1.94375 9.28133 1.99116 9.33825 2.08599L10.3274 3.73397C10.3843 3.82879 10.4128 3.87621 10.4586 3.90216C10.5045 3.92811 10.5598 3.92811 10.6704 3.92811H12.6607C12.7713 3.92811 12.8267 3.92811 12.8725 3.95408C12.9184 3.98005 12.9468 4.0275 13.0037 4.1224L13.9849 5.7586C14.045 5.85886 14.0751 5.90899 14.0751 5.96437C14.0751 6.01975 14.045 6.06987 13.9849 6.17011L13.0107 7.79377Z" stroke-miterlimit="10"></path>',
+].join('')
+
+let menuActive = false
+const activeSubscribers = new Set()
+
+/** @returns whether the menu currently owns the navigation. */
+export function getMenuActive() {
+  return menuActive
+}
+
+/**
+ * Subscribe to ownership changes; the launcher occupant renders through this.
+ * @param listener - called after every change.
+ * @returns unsubscribe.
+ */
+export function subscribeMenuActive(listener) {
+  activeSubscribers.add(listener)
+  return () => {
+    activeSubscribers.delete(listener)
+  }
+}
+
+/**
+ * Flip ownership; the controller drives this and subscribers re-render.
+ * @param next - new ownership state.
+ */
+export function setMenuActive(next) {
+  if (menuActive === next) return
+  menuActive = next
+  for (const listener of [...activeSubscribers]) {
+    try {
+      listener()
+    } catch (error) {
+      console.error('[settings-button] menu subscriber failed:', error)
+    }
+  }
+}
+
+/** Launcher facts handed over by the `settings.launcher` occupant. */
+const launcher = { openSettings: undefined, label: 'Settings' }
+
+/**
+ * Publish the settings action and its localized label for the popover row.
+ * @param next - values read from the launcher occupant's props.
+ * @returns the shared object (callers never mutate it).
+ */
+export function publishLauncher(next) {
+  if (typeof next.openSettings === 'function') launcher.openSettings = next.openSettings
+  if (typeof next.label === 'string' && next.label !== '') launcher.label = next.label
+  return launcher
+}
+
+/** @returns the launcher facts (live object). */
+export function getLauncher() {
+  return launcher
+}
+
+/**
+ * Whether the sidebar is expanded.
+ *
+ * The collapsed column keeps its expanded width while the frame's grid track
+ * clips it, so the column's own box cannot answer this. The shell marks the
+ * collapse state on an attribute; the width is only the fallback for a shell
+ * that stops publishing it.
+ * @param root - sidebar column.
+ * @returns whether the wide layout is active.
+ */
+function isWide(root) {
+  const marker = document.querySelector('[data-sidebar-collapsed]')
+  const value = marker?.getAttribute('data-sidebar-collapsed')
+  if (value === 'true') return false
+  if (value === 'false') return true
+  return root.getBoundingClientRect().width > WIDE_MIN_WIDTH
+}
+
+/**
+ * Find the sidebar's brand row and column.
+ *
+ * `[data-window-drag]` marks the frame's drag surfaces: on macOS the window
+ * chrome strip (which holds the collapse toggle) and the brand row are separate
+ * siblings, everywhere else the brand row holds the toggle itself.
+ * @returns the anchors, or null while the sidebar is not mounted.
+ */
+function locate() {
+  // A drawer copy of the sidebar can be mounted alongside the column; prefer
+  // the one that is actually laid out.
+  const toggles = [...document.querySelectorAll('button[data-sidebar-toggle]')]
+  const toggle = toggles.find((candidate) => candidate.offsetParent !== null) ?? toggles[0]
+  const strip = toggle?.parentElement ?? null
+  if (strip === null) return null
+  const sibling = strip.nextElementSibling
+  const brandRow = sibling instanceof HTMLElement && sibling.hasAttribute('data-window-drag') && !sibling.contains(toggle)
+    ? sibling
+    : strip
+  const root = brandRow.parentElement
+  if (root === null) return null
+  return { toggle, brandRow, root }
+}
+
+/**
+ * The shipped panel list: a `<nav>` that is a direct child of the sidebar's
+ * scrollport. Only matched while it is still where the shell rendered it.
+ * @param root - sidebar column.
+ * @returns the nav, or null.
+ */
+function findNav(root) {
+  const scrollport = root.querySelector('[data-sidebar-scrollport]')
+  if (scrollport === null) return null
+  const nav = scrollport.querySelector(':scope > nav')
+  return nav instanceof HTMLElement ? nav : null
+}
+
+/**
+ * The popover must live inside the app root: React delegates every synthetic
+ * event to that container, so a row moved outside it (document.body) would
+ * render and hover but never run its own click handler.
+ * @returns the container to append to.
+ */
+function mountPoint() {
+  return document.getElementById('root') ?? document.body
+}
+
+/**
+ * Build the trigger, the popover shell and the Settings row once per mount.
+ * @param translate - dictionary lookup for the trigger label.
+ * @returns the element bundle.
+ */
+function createElements(translate) {
+  // A group, not a menu: the popover holds the shipped navigation buttons plus
+  // the Settings action, and only the More row owns a real menu role.
+  const popoverId = `dsh-sidebar-menu-${Math.random().toString(36).slice(2, 8)}`
+  const trigger = document.createElement('button')
+  trigger.type = 'button'
+  trigger.className = 'dsb-trigger'
+  trigger.setAttribute('data-dsh-sidebar-menu', '')
+  trigger.setAttribute('aria-expanded', 'false')
+  trigger.setAttribute('aria-controls', popoverId)
+  trigger.setAttribute('aria-label', translate('menu'))
+  trigger.title = translate('menu')
+  // The desktop brand row is a window-drag surface; keep the button clickable
+  // and above whatever the shell paints in that row.
+  trigger.style.setProperty('-webkit-app-region', 'no-drag')
+  trigger.style.setProperty('position', 'relative')
+  trigger.style.setProperty('z-index', '2')
+  trigger.innerHTML = MENU_GLYPH
+
+  const popover = document.createElement('div')
+  popover.id = popoverId
+  popover.className = 'dsb-menu'
+  popover.setAttribute('data-dsh-sidebar-menu-popover', '')
+  popover.setAttribute('role', 'group')
+  popover.setAttribute('aria-label', translate('menu'))
+  popover.tabIndex = -1
+  popover.hidden = true
+
+  const navHost = document.createElement('div')
+  navHost.className = 'dsb-menu-nav'
+
+  const separator = document.createElement('div')
+  separator.className = 'dsb-menu-separator'
+  separator.setAttribute('aria-hidden', 'true')
+
+  const settings = document.createElement('button')
+  settings.type = 'button'
+  settings.className = 'dsb-menu-row'
+  settings.innerHTML = `${SETTINGS_GLYPH}<span class="dsb-menu-label"></span>`
+
+  popover.append(navHost, separator, settings)
+  mountPoint().append(popover)
+
+  return { trigger, popover, navHost, separator, settings }
+}
+
+/**
+ * Mount the trigger + popover pair over one sidebar lifetime.
+ * @param translate - dictionary lookup for chrome labels.
+ */
+function createController(translate) {
+  let disposed = false
+  let elements = null
+  let nav = null
+  /** Where the nav came from: `{ parent, next }`. */
+  let home = null
+  let root = null
+  let open = false
+  let wide = true
+  let timer = 0
+  const retries = new Set()
+  let observer = null
+  let resizer = null
+  let attributeObserver = null
+  let markerSeen = null
+  let interval = 0
+
+  /** @param event - click on the trigger. */
+  const onTrigger = (event) => {
+    event.preventDefault()
+    event.stopPropagation()
+    if (open) close(true)
+    else openMenu()
+  }
+
+  /** Settings row: hand over to the shell's settings store and close. */
+  const onSettings = () => {
+    const action = launcher.openSettings
+    close(false)
+    if (typeof action !== 'function') return
+    try {
+      action()
+    } catch (error) {
+      console.error('[settings-button] could not open settings:', error)
+    }
+  }
+
+  /** A click on a moved panel row changes the main column; the menu has done its job. */
+  const onNavClick = (event) => {
+    const target = event.target
+    if (!(target instanceof Element)) return
+    const button = target.closest('button')
+    // The More row opens its own fly-out: keep the menu open behind it.
+    if (button !== null && button.getAttribute('aria-haspopup') === 'menu') return
+    close(false)
+  }
+
+  /** @param event - document pointerdown while open. */
+  const onPointerDown = (event) => {
+    if (!open) return
+    const target = event.target
+    if (!(target instanceof Node)) return
+    if (elements === null) return
+    if (elements.popover.contains(target) || elements.trigger.contains(target)) return
+    // A nested shipped menu (the More fly-out) is portalled outside the popover.
+    if (target instanceof Element && target.closest('[role="menu"],[role="dialog"],[role="alertdialog"]') !== null) return
+    close(false)
+  }
+
+  /** @param event - document keydown while open. */
+  const onKeyDown = (event) => {
+    if (!open || event.key !== 'Escape') return
+    event.stopPropagation()
+    close(true)
+  }
+
+  const onViewportChange = () => {
+    if (open) position()
+  }
+
+  /** @param restoreFocus - return focus to the trigger (Escape / re-click). */
+  function close(restoreFocus) {
+    if (!open || elements === null) return
+    open = false
+    elements.popover.hidden = true
+    elements.trigger.setAttribute('aria-expanded', 'false')
+    document.removeEventListener('pointerdown', onPointerDown, true)
+    document.removeEventListener('keydown', onKeyDown, true)
+    window.removeEventListener('resize', onViewportChange)
+    if (restoreFocus) {
+      try {
+        elements.trigger.focus({ preventScroll: true })
+      } catch {}
+    }
+  }
+
+  /**
+   * Copy the sidebar's resolved geometry variables onto the popover, which is
+   * outside the column and would otherwise inherit none of them.
+   */
+  function copySidebarTokens() {
+    if (elements === null || root === null) return
+    try {
+      const computed = window.getComputedStyle(root)
+      for (const name of SIDEBAR_TOKENS) {
+        const value = computed.getPropertyValue(name).trim()
+        if (value !== '') elements.popover.style.setProperty(name, value)
+      }
+    } catch (error) {
+      console.error('[settings-button] could not copy sidebar geometry:', error)
+    }
+  }
+
+  /** Place the popover under the trigger, clamped into the viewport. */
+  function position() {
+    if (elements === null) return
+    const rect = elements.trigger.getBoundingClientRect()
+    const width = elements.popover.offsetWidth
+    const height = elements.popover.offsetHeight
+    const viewportWidth = window.innerWidth
+    const viewportHeight = window.innerHeight
+    const left = Math.min(
+      Math.max(VIEWPORT_MARGIN, rect.right - width),
+      Math.max(VIEWPORT_MARGIN, viewportWidth - width - VIEWPORT_MARGIN),
+    )
+    const below = rect.bottom + GAP
+    const above = rect.top - height - GAP
+    const top = below + height + VIEWPORT_MARGIN <= viewportHeight || above < VIEWPORT_MARGIN
+      ? Math.min(below, Math.max(VIEWPORT_MARGIN, viewportHeight - height - VIEWPORT_MARGIN))
+      : above
+    elements.popover.style.left = `${Math.round(left)}px`
+    elements.popover.style.top = `${Math.round(top)}px`
+  }
+
+  /** Open the popover over the shipped navigation. */
+  function openMenu() {
+    if (elements === null) return
+    // Re-read the sidebar's layout at click time: a cached flag must never be
+    // the reason a click appears to do nothing on the desktop shell.
+    const anchors = locate()
+    if (anchors === null || !isWide(anchors.root)) return
+    // A navigation that cannot be moved must not stop the Settings action.
+    if (nav === null && !attachNav()) {
+      console.warn('[settings-button] panel navigation unavailable; opening Settings only')
+    }
+    const hasSettings = typeof launcher.openSettings === 'function'
+    elements.settings.hidden = !hasSettings
+    elements.separator.hidden = !hasSettings || elements.navHost.childElementCount === 0
+    elements.settings.querySelector('.dsb-menu-label').textContent = launcher.label
+    copySidebarTokens()
+    elements.popover.hidden = false
+    open = true
+    elements.trigger.setAttribute('aria-expanded', 'true')
+    position()
+    document.addEventListener('pointerdown', onPointerDown, true)
+    document.addEventListener('keydown', onKeyDown, true)
+    window.addEventListener('resize', onViewportChange)
+    console.info('[settings-button] menu opened')
+    // Focus the container, not the first row: a focused shipped row reveals its
+    // unpin affordance, which reads as a stray icon in the popover.
+    try {
+      elements.popover.focus({ preventScroll: true })
+    } catch {}
+  }
+
+  /** Move the shipped nav into the popover. @returns whether it is there now. */
+  function attachNav() {
+    if (nav !== null && nav.parentElement === elements?.navHost) return true
+    const found = nav !== null && nav.isConnected ? nav : findNav(root)
+    if (found === null) return false
+    if (home === null && found.parentElement !== null) {
+      home = { parent: found.parentElement, next: found.nextSibling }
+    }
+    try {
+      elements.navHost.append(found)
+    } catch (error) {
+      console.error('[settings-button] could not move the panel navigation:', error)
+      return false
+    }
+    if (nav !== null && nav !== found && nav.parentElement === elements.navHost) nav.remove()
+    nav = found
+    nav.addEventListener('click', onNavClick)
+    return true
+  }
+
+  /** Hand the nav back to the sidebar. */
+  function detachNav() {
+    if (nav === null) return
+    nav.removeEventListener('click', onNavClick)
+    if (home !== null) {
+      const { parent, next } = home
+      try {
+        const reference = next instanceof Node && next.parentNode === parent ? next : null
+        parent.insertBefore(nav, reference)
+      } catch (error) {
+        console.error('[settings-button] could not return the panel navigation:', error)
+      }
+    }
+    nav = null
+    home = null
+  }
+
+  /** @param trigger - the menu trigger. */
+  /**
+   * @param trigger - the menu trigger.
+   * @param anchors - sidebar anchors for this sync.
+   */
+  function placeTrigger(trigger, anchors) {
+    if (trigger.parentElement === anchors.brandRow) return
+    const reference = anchors.brandRow.contains(anchors.toggle) ? anchors.toggle : null
+    anchors.brandRow.insertBefore(trigger, reference)
+  }
+
+  /** Reconcile the DOM with the sidebar's current shape. */
+  function sync() {
+    if (disposed) return
+    const anchors = locate()
+    if (anchors === null) {
+      stand(nav !== null)
+      return
+    }
+    root = anchors.root
+    const nextWide = isWide(root)
+    if (nextWide !== wide) {
+      wide = nextWide
+      close(false)
+    }
+    if (!wide) {
+      stand(nav !== null)
+      return
+    }
+    if (elements !== null && !elements.popover.isConnected) teardownElements()
+    if (elements === null) {
+      elements = createElements(translate)
+      elements.trigger.addEventListener('click', onTrigger)
+      elements.settings.addEventListener('click', onSettings)
+    }
+    watchCollapseMarker()
+    placeTrigger(elements.trigger, anchors)
+    if (!attachNav()) {
+      // Without the panel list there is nothing worth hiding.
+      stand(true)
+      return
+    }
+    observe(root)
+    setMenuActive(true)
+  }
+
+  /**
+   * Give the navigation back and drop ownership.
+   * @param detach - whether the nav is currently moved.
+   */
+  function stand(detach) {
+    close(false)
+    if (detach) detachNav()
+    if (elements !== null && elements.trigger.parentElement !== null) elements.trigger.remove()
+    setMenuActive(false)
+    nav = null
+    home = null
+  }
+
+  /**
+   * Follow the sidebar column's width so collapsing and expanding re-syncs.
+   * @param column - sidebar root.
+   */
+  function observe(column) {
+    if (resizer !== null) return
+    if (typeof ResizeObserver === 'undefined') return
+    resizer = new ResizeObserver(() => { schedule() })
+    // The column itself keeps its expanded width while the frame's grid track
+    // clips it, so watch the wrapper that really changes size.
+    resizer.observe(column.parentElement ?? column)
+  }
+
+  /**
+   * Follow the shell's collapse marker. The attribute flips before the layout
+   * settles, which is exactly when the trigger must leave or return.
+   */
+  function watchCollapseMarker() {
+    const marker = document.querySelector('[data-sidebar-collapsed]')
+    if (marker === null || marker === markerSeen) return
+    markerSeen = marker
+    attributeObserver?.disconnect()
+    if (typeof MutationObserver === 'undefined') return
+    attributeObserver = new MutationObserver(() => { schedule() })
+    attributeObserver.observe(marker, { attributes: true, attributeFilter: ['data-sidebar-collapsed'] })
+  }
+
+  /**
+   * Guard against shells that neither resize the wrapper nor publish the marker:
+   * a cheap state comparison, not a render loop.
+   */
+  function poll() {
+    if (disposed) return
+    const anchors = locate()
+    if (anchors === null) {
+      if (menuActive) schedule()
+      return
+    }
+    if (isWide(anchors.root) !== wide || !menuActive) schedule()
+  }
+
+  /** Coalesce syncs from resize and DOM churn. */
+  function schedule() {
+    if (disposed || timer !== 0) return
+    timer = window.setTimeout(() => {
+      timer = 0
+      try {
+        sync()
+      } catch (error) {
+        console.error('[settings-button] sidebar menu sync failed:', error)
+      }
+    }, SYNC_DEBOUNCE_MS)
+  }
+
+  /** Re-sync whenever the sidebar is rebuilt (theme swap, column remount). */
+  function watch() {
+    if (typeof MutationObserver === 'undefined' || observer !== null) return
+    observer = new MutationObserver(() => {
+      if (disposed) return
+      const missingTrigger = elements === null || !elements.trigger.isConnected
+      const missingNav = nav !== null && !nav.isConnected
+      if (missingTrigger || missingNav) schedule()
+    })
+    observer.observe(document.body, { childList: true, subtree: true })
+  }
+
+  return {
+    start() {
+      watch()
+      schedule()
+      interval = window.setInterval(() => {
+        try {
+          poll()
+        } catch (error) {
+          console.error('[settings-button] sidebar menu poll failed:', error)
+        }
+      }, POLL_MS)
+      // The sidebar mounts after the client plugin; a background window also
+      // throttles frame callbacks, so retry on plain timers.
+      for (const delay of RETRY_DELAYS) {
+        const handle = window.setTimeout(() => {
+          retries.delete(handle)
+          try {
+            sync()
+          } catch (error) {
+            console.error('[settings-button] sidebar menu sync failed:', error)
+          }
+        }, delay)
+        retries.add(handle)
+      }
+    },
+    dispose() {
+      disposed = true
+      if (timer !== 0) window.clearTimeout(timer)
+      for (const handle of retries) window.clearTimeout(handle)
+      retries.clear()
+      if (interval !== 0) window.clearInterval(interval)
+      attributeObserver?.disconnect()
+      attributeObserver = null
+      markerSeen = null
+      observer?.disconnect()
+      resizer?.disconnect()
+      observer = null
+      resizer = null
+      detachNav()
+      if (elements !== null) {
+        elements.trigger.removeEventListener('click', onTrigger)
+        elements.settings.removeEventListener('click', onSettings)
+        elements.popover.remove()
+        elements.trigger.remove()
+        elements = null
+      }
+      setMenuActive(false)
+    },
+  }
+}
+
+/**
+ * Start the sidebar menu and return its disposer.
+ * @param options - `translate` resolves chrome labels from our dictionary.
+ * @returns disposer; never throws.
+ */
+export function startSidebarMenu(options = {}) {
+  if (typeof document === 'undefined' || typeof window === 'undefined') return () => {}
+  const translate = typeof options.translate === 'function' ? options.translate : (key) => (key === 'menu' ? 'Menu' : key)
+  try {
+    const controller = createController(translate)
+    controller.start()
+    return () => {
+      try {
+        controller.dispose()
+      } catch (error) {
+        console.error('[settings-button] sidebar menu teardown failed:', error)
+      }
+    }
+  } catch (error) {
+    console.error('[settings-button] sidebar menu failed to start:', error)
+    return () => {}
+  }
+}
